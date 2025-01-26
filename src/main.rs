@@ -1,9 +1,12 @@
 use std::{io, thread, env, fs};
 use std::process::{exit, Command, Stdio};
-use std::io::{ErrorKind, IoSlice, Read, Write, Error};
+use std::io::{ErrorKind, IoSlice, Read, Write, Error, BufWriter};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::fs::FileTypeExt;
 use native_dialog::{MessageDialog};
+use sha2::Digest;
+use base64ct::{Base64, Encoding};
+use log::*;
 
 const SSH_AGENTC_REQUEST_IDENTITIES : u8 = 11;
 const SSH_AGENTC_SIGN_REQUEST : u8 = 13;
@@ -15,11 +18,12 @@ const SSH_AGENT_IDENTITIES_ANSWER : u8 = 12;
 #[derive(Clone, Debug)]
 struct Config {
     always_confirm: bool,
-    paths: Vec<String>,
+    subagent_paths: Vec<String>,
 }
 
 fn server_thread(listener: UnixListener, config: Config) -> io::Result<()> {
     for client in listener.incoming() {
+        debug!("New client connection");
         let config_copy = config.clone();
         thread::spawn(move || connection_thread(client?, config_copy));
     }
@@ -29,9 +33,12 @@ fn server_thread(listener: UnixListener, config: Config) -> io::Result<()> {
 fn connection_thread(client: UnixStream, config: Config) -> io::Result<()> {
     let mut subagents = Vec::new();
 
-    for path in &config.paths {
+    for path in &config.subagent_paths {
         match UnixStream::connect(path) {
-            Ok(agent) => subagents.push(agent),
+            Ok(agent) => {
+                debug!("Connection established with {:?}", path);
+                subagents.push(agent)
+            },
             Err(err) => eprintln!("failed to connect to {} {}", path, err),
         }
     }
@@ -42,16 +49,23 @@ fn connection_thread(client: UnixStream, config: Config) -> io::Result<()> {
 
     loop {
         let request = read_packet(&client)?;
-
+        debug!("Client request:\n{}", hexdump(&request));
         let mut result = vec![SSH_AGENT_FAILURE];
 
         if request[0] == SSH_AGENTC_REQUEST_IDENTITIES {
             for subagent in &subagents {
+                debug!("Forwarding request to {:?}", subagent);
                 write_packet(&subagent, &request)?;
                 let response = read_packet(&subagent)?;
+                debug!("Response:\n{}", hexdump(&response));
                 result = merge_identities(result, response)?;
             }
             write_packet(&client, &result)?;
+            if subagents.len() > 1 {
+                debug!("Sending merged response to client:\n{}", hexdump(&result));
+            } else {
+                debug!("Sending last response to client");
+            }
             continue;
         }
 
@@ -59,19 +73,23 @@ fn connection_thread(client: UnixStream, config: Config) -> io::Result<()> {
         if config.always_confirm && request[0] == SSH_AGENTC_SIGN_REQUEST {
             let keyblob = read_bstring(&request[1..])?;
             if !confirm_usage(&keyblob) {
+                debug!("Usage denied! Sending failure response to client");
                 write_packet(&client, &vec![SSH_AGENT_FAILURE])?;
                 continue;
             }
         }
         // for all requests other than identities request just return first successful answer
-        for socket in &subagents {
-            write_packet(&socket, &request)?;
-            let response = read_packet(&socket)?;
+        for subagent in &subagents {
+            debug!("Forwarding request to {:?}", subagent.peer_addr()?);
+            write_packet(&subagent, &request)?;
+            let response = read_packet(&subagent)?;
+            debug!("Received response:\n{}", hexdump(&response));
             if response[0] != SSH_AGENT_FAILURE {
                 result = response;
                 break;
             }
         }
+        debug!("Sending last response to client");
         write_packet(&client, &result)?;
     }
 }
@@ -103,8 +121,9 @@ fn confirm_usage(keyblob : &[u8]) -> bool {
 }
 
 fn fingerprint(keyblob: &[u8]) -> String {
-    let digest = openssl::sha::sha256(&keyblob);
-    openssl::base64::encode_block(&digest)
+    let digest = sha2::Sha256::digest(keyblob);
+    let mut enc_buf = [0u8; 64];
+    Base64::encode(digest.as_slice(), &mut enc_buf).unwrap().to_string()
 }
 
 fn read_u32(bytes: &[u8]) -> io::Result<u32> {
@@ -139,40 +158,49 @@ fn write_packet(mut stream: &UnixStream, packet: &[u8]) -> io::Result<usize> {
     stream.write_vectored(&[IoSlice::new(&lenbuf), IoSlice::new(&packet)])
 }
 
-// fn hexdump(v : &[u8]) {
-//     let mut p = kex::Printer::default_fmt_with(std::io::stderr(), 0);
-//     p.write(v).unwrap();
-// }
+fn hexdump(v : &[u8]) -> String {
+    let mut p = kex::Printer::default_fmt_with(BufWriter::new(Vec::new()), 0);
+    p.push(v).unwrap();
+    String::from_utf8(p.finish().into_inner().unwrap()).unwrap()
+}
+
+fn usage(rc : i32) {
+    let current_exe = env::current_exe().unwrap();
+    let program_name = current_exe.file_name().unwrap();
+    eprintln!("Usage: {} [-p] [ADDITIONAL_SUBAGENT_PATH]...\n", program_name.to_str().unwrap());
+    eprintln!("  -p, --permissive    do not show confirmation dialog");
+    eprintln!("                      only useful when additional subagents are used");
+    eprintln!("  -h, --help          this usage help");
+    eprintln!("");
+    eprintln!("Always proxies the current agent pointed by SSH_AUTH_SOCK environment variable.");
+    eprintln!("You can specify additional agents that should be queried in case when you want");
+    eprintln!("to use keys from multiple sources.");
+    eprintln!("In case multiple agents are used all client requests (beside identities request)");
+    eprintln!("are processed sequentially until receiving first successfull response from sub agent.");
+    exit(rc);
+}
 
 fn main() {
+    env_logger::init();
+
     let mut config = Config {
-        always_confirm: false,
-        paths: vec![],
+        always_confirm: true,
+        subagent_paths: vec![],
     };
 
-    let prev_auth_sock : String;
-    match env::var("SSH_AUTH_SOCK") {
-        Ok(sock) => {
-            prev_auth_sock = sock.to_string();
-            config.paths.push(sock.to_string())
-        },
-        Err(_) => {
-            eprintln!("SSH_AUTH_SOCK environment variable not found");
-            exit(1);
-        }
-    }
-
     for arg in env::args().skip(1) {
-        if arg == "-c" {
-            config.always_confirm = true;
+        if arg == "-p" || arg == "--permissive" {
+            config.always_confirm = false;
+        } else if arg == "-h" || arg == "--help" {
+            usage(0);
         } else if arg.starts_with("-") {
             eprintln!("Unknown flag: {}", arg);
-            exit(1);
+            usage(1);
         } else {
             match fs::metadata(&arg) {
                 Ok(metadata) => {
                     if metadata.file_type().is_socket() {
-                        config.paths.push(arg);
+                        config.subagent_paths.push(arg);
                     } else {
                         eprintln!("Given path is not unix socket: {}", arg);
                         exit(1);
@@ -186,7 +214,19 @@ fn main() {
         }
     }
 
-    let our_sock_name = env::temp_dir().join(format!("ssh1agent-{}.sock", std::process::id()));
+    let prev_auth_sock : String;
+    match env::var("SSH_AUTH_SOCK") {
+        Ok(sock) => {
+            prev_auth_sock = sock.to_string();
+            config.subagent_paths.push(sock.to_string())
+        },
+        Err(_) => {
+            eprintln!("SSH_AUTH_SOCK environment variable not found");
+            exit(1);
+        }
+    }
+
+    let our_sock_name = env::temp_dir().join(format!("ssh-agentex-{}.sock", std::process::id()));
     let listener = UnixListener::bind(&our_sock_name).expect("failed to bind socket");
 
     thread::spawn(move || server_thread(listener, config));
