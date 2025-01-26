@@ -1,0 +1,9 @@
+[package]
+name = "test-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kex = "0.2.6"
+native-dialog = "0.7.0"
+openssl = "0.10.68"
